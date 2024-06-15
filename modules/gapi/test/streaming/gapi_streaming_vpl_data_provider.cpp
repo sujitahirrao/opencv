@@ -16,6 +16,7 @@
 #include "streaming/onevpl/demux/async_mfp_demux_data_provider.hpp"
 #include "streaming/onevpl/source_priv.hpp"
 
+#ifdef _WIN32
 namespace opencv_test
 {
 namespace
@@ -38,8 +39,6 @@ array_element_t files[] = {
     array_element_t {"highgui/video/sample_322x242_15frames.yuv420p.libaom-av1.mp4",
                                     true,      true,           true},
     array_element_t {"highgui/video/sample_322x242_15frames.yuv420p.libvpx-vp9.mp4",
-                                    true,      true,           true},
-    array_element_t {"highgui/video/sample_322x242_15frames.yuv420p.libx264.avi",
                                     true,      true,           true},
     array_element_t {"highgui/video/sample_322x242_15frames.yuv420p.libx264.mp4",
                                     true,      true,           true},
@@ -75,19 +74,19 @@ TEST_P(OneVPL_Source_MFPAsyncDispatcherTest, open_and_decode_file)
     EXPECT_TRUE(dd_result);
 
     // initialize MFX
-    mfxLoader mfx_handle = MFXLoad();
+    mfxLoader mfx = MFXLoad();
 
-    mfxConfig cfg_inst_0 = MFXCreateConfig(mfx_handle);
+    mfxConfig cfg_inst_0 = MFXCreateConfig(mfx);
     EXPECT_TRUE(cfg_inst_0);
     mfxVariant mfx_param_0;
     mfx_param_0.Type = MFX_VARIANT_TYPE_U32;
     mfx_param_0.Data.U32 = provider_ptr->get_mfx_codec_id();
-    EXPECT_EQ(MFXSetConfigFilterProperty(cfg_inst_0,(mfxU8 *)"mfxImplDescription.mfxDecoderDescription.decoder.CodecID",
+    EXPECT_EQ(MFXSetConfigFilterProperty(cfg_inst_0,(mfxU8 *)CfgParam::decoder_id_name(),
                                                     mfx_param_0), MFX_ERR_NONE);
 
     // create MFX session
     mfxSession mfx_session{};
-    mfxStatus sts = MFXCreateSession(mfx_handle, 0, &mfx_session);
+    mfxStatus sts = MFXCreateSession(mfx, 0, &mfx_session);
     EXPECT_EQ(MFX_ERR_NONE, sts);
 
     // create proper bitstream
@@ -114,7 +113,7 @@ TEST_P(OneVPL_Source_MFPAsyncDispatcherTest, open_and_decode_file)
 
     MFXVideoDECODE_Close(mfx_session);
     MFXClose(mfx_session);
-    MFXUnload(mfx_handle);
+    MFXUnload(mfx);
 }
 
 
@@ -135,7 +134,7 @@ TEST_P(OneVPL_Source_MFPAsyncDispatcherTest, choose_dmux_provider)
         EXPECT_FALSE(dd_result);
         provider_ptr = DataProviderDispatcher::create(path,
                                 { CfgParam::create<std::string>(
-                                            "mfxImplDescription.mfxDecoderDescription.decoder.CodecID",
+                                            CfgParam::decoder_id_name(),
                                             "MFX_CODEC_HEVC") /* Doesn't matter what codec for RAW here*/});
         EXPECT_TRUE(std::dynamic_pointer_cast<FileDataProvider>(provider_ptr));
         GTEST_SUCCEED();
@@ -301,4 +300,5 @@ TEST(OneVPL_Source_MFPAsyncDemux, produce_consume) {
 }
 } // namespace opencv_test
 
+#endif // _WIN32
 #endif // HAVE_ONEVPL

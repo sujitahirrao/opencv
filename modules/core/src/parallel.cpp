@@ -128,6 +128,8 @@
     #include <ppltasks.h>
 #elif defined HAVE_CONCURRENCY
     #include <ppl.h>
+#elif defined HAVE_PTHREADS_PF
+    #include <pthread.h>
 #endif
 
 
@@ -152,6 +154,9 @@
 #include "parallel_impl.hpp"
 
 #include "opencv2/core/detail/exception_ptr.hpp"  // CV__EXCEPTION_PTR = 1 if std::exception_ptr is available
+
+#include <opencv2/core/utils/fp_control_utils.hpp>
+#include <opencv2/core/utils/fp_control.private.hpp>
 
 using namespace cv;
 
@@ -203,6 +208,9 @@ namespace {
 
             // propagate main thread state
             rng = cv::theRNG();
+#if OPENCV_SUPPORTS_FP_DENORMALS_HINT && OPENCV_IMPL_FP_HINTS
+            details::saveFPDenormalsState(fp_denormals_base_state);
+#endif
 
 #ifdef OPENCV_TRACE
             traceRootRegion = CV_TRACE_NS::details::getCurrentRegion();
@@ -269,7 +277,9 @@ namespace {
         void recordException(const cv::String& msg)
 #endif
         {
+#ifndef CV_THREAD_SANITIZER
             if (!hasException)
+#endif
             {
                 cv::AutoLock lock(cv::getInitializationMutex());
                 if (!hasException)
@@ -283,6 +293,11 @@ namespace {
                 }
             }
         }
+
+#if OPENCV_SUPPORTS_FP_DENORMALS_HINT && OPENCV_IMPL_FP_HINTS
+        details::FPDenormalsModeState fp_denormals_base_state;
+#endif
+
     private:
         ParallelLoopBodyWrapperContext(const ParallelLoopBodyWrapperContext&); // disabled
         ParallelLoopBodyWrapperContext& operator=(const ParallelLoopBodyWrapperContext&); // disabled
@@ -319,6 +334,9 @@ namespace {
 
             // propagate main thread state
             cv::theRNG() = ctx.rng;
+#if OPENCV_SUPPORTS_FP_DENORMALS_HINT && OPENCV_IMPL_FP_HINTS
+            FPDenormalsIgnoreHintScope fp_denormals_scope(ctx.fp_denormals_base_state);
+#endif
 
             cv::Range r;
             cv::Range wholeRange = ctx.wholeRange;
@@ -773,7 +791,7 @@ int getThreadNum()
         return 0;
     #endif
 #elif defined HAVE_HPX
-        return (int)(hpx::get_num_worker_threads());
+    return (int)(hpx::get_num_worker_threads());
 #elif defined HAVE_OPENMP
     return omp_get_thread_num();
 #elif defined HAVE_GCD
@@ -852,7 +870,22 @@ int getNumberOfCPUsImpl(const char *filename)
 
 #if defined CV_HAVE_CGROUPS
 static inline
-unsigned getNumberOfCPUsCFS()
+unsigned getNumberOfCPUsCFSv2()
+{
+    int cfs_quota = 0;
+    int cfs_period = 0;
+
+    std::ifstream ss_cpu_max("/sys/fs/cgroup/cpu.max", std::ios::in | std::ios::binary);
+    ss_cpu_max >> cfs_quota >> cfs_period;
+
+    if (ss_cpu_max.fail() || cfs_quota < 1 || cfs_period < 1) /* values must not be 0 or negative */
+        return 0;
+
+    return (unsigned)max(1, cfs_quota/cfs_period);
+}
+
+static inline
+unsigned getNumberOfCPUsCFSv1()
 {
     int cfs_quota = 0;
     {
@@ -894,8 +927,7 @@ int getNumberOfCPUs_()
      * the minimum most value as it has high probablity of being right and safe.
      * Return 1 if we get 0 or not found on all methods.
     */
-#if defined CV_CXX11 \
-    && !defined(__MINGW32__) /* not implemented (2020-03) */ \
+#if !defined(__MINGW32__) /* not implemented (2020-03) */
 
     /*
      * Check for this standard C++11 way, we do not return directly because
@@ -949,8 +981,11 @@ int getNumberOfCPUs_()
     static unsigned ncpus_impl_cpuset = (unsigned)getNumberOfCPUsImpl("/sys/fs/cgroup/cpuset/cpuset.cpus");
     ncpus = minNonZero(ncpus, ncpus_impl_cpuset);
 
-    static unsigned ncpus_impl_cfs = getNumberOfCPUsCFS();
-    ncpus = minNonZero(ncpus, ncpus_impl_cfs);
+    static unsigned ncpus_impl_cfs_v1 = getNumberOfCPUsCFSv1();
+    ncpus = minNonZero(ncpus, ncpus_impl_cfs_v1);
+
+    static unsigned ncpus_impl_cfs_v2 = getNumberOfCPUsCFSv2();
+    ncpus = minNonZero(ncpus, ncpus_impl_cfs_v2);
 #endif
 
     static unsigned ncpus_impl_devices = (unsigned)getNumberOfCPUsImpl("/sys/devices/system/cpu/online");
@@ -972,7 +1007,7 @@ int getNumberOfCPUs_()
 
 #endif
 
-#if !defined(_WIN32) && !defined(__APPLE__)
+#if !defined(_WIN32) && !defined(__APPLE__) && defined(_SC_NPROCESSORS_ONLN)
 
     static unsigned cpu_count_sysconf = (unsigned)sysconf( _SC_NPROCESSORS_ONLN );
     ncpus = minNonZero(ncpus, cpu_count_sysconf);

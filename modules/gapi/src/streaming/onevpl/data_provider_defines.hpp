@@ -2,8 +2,7 @@
 #define GAPI_STREAMING_ONEVPL_DATA_PROVIDER_DEFINES_HPP
 
 #ifdef HAVE_ONEVPL
-#include <vpl/mfxcommon.h>
-#include <vpl/mfxvideo.h>
+#include "streaming/onevpl/onevpl_export.hpp"
 #endif // HAVE_ONEVPL
 
 #include <opencv2/gapi/own/assert.hpp>
@@ -19,7 +18,7 @@ struct IDataProvider::mfx_bitstream : public mfxBitstream {};
 #else // HAVE_ONEVPL
 struct IDataProvider::mfx_bitstream {
     mfx_bitstream() {
-        GAPI_Assert(false && "Reject to create `mfxBitstream` because library compiled without VPL/MFX support");
+        GAPI_Error("Reject to create `mfxBitstream` because library compiled without VPL/MFX support");
     }
 };
 #endif // HAVE_ONEVPL

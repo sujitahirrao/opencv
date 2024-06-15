@@ -18,6 +18,7 @@
 
 #include <windows.h>
 #include <guiddef.h>
+#include <initguid.h>
 #include <mfidl.h>
 #include <mfapi.h>
 #include <mfplay.h>
@@ -29,13 +30,16 @@
 #ifdef HAVE_MSMF_DXVA
 #include <d3d11.h>
 #include <d3d11_4.h>
+#include <locale>
 #endif
 #include <new>
 #include <map>
+#include <queue>
 #include <vector>
 #include <string>
 #include <algorithm>
 #include <deque>
+#include <iterator>
 #include <stdio.h>
 #include <stdarg.h>
 #include <string.h>
@@ -156,6 +160,11 @@ private:
 #define _ComPtr ComPtr
 
 template <typename T> inline T absDiff(T a, T b) { return a >= b ? a - b : b - a; }
+
+// synonym for system MFVideoFormat_D16. D3DFMT_D16 = 80
+// added to fix builds with old MSVS and platform SDK
+// see https://learn.microsoft.com/en-us/windows/win32/medfound/video-subtype-guids#luminance-and-depth-formats
+DEFINE_MEDIATYPE_GUID( OCV_MFVideoFormat_D16, 80 );
 
 //==================================================================================================
 
@@ -346,6 +355,10 @@ struct MediaType
         }
         return false;
     }
+    bool VideoIsAvailable() const
+    {
+        return (subType != OCV_MFVideoFormat_D16);
+    }
 };
 
 void printFormat(std::ostream& out, const GUID& fmt)
@@ -395,8 +408,10 @@ private:
 class SourceReaderCB : public IMFSourceReaderCallback
 {
 public:
+    static const size_t MSMF_READER_MAX_QUEUE_SIZE = 3;
+
     SourceReaderCB() :
-        m_nRefCount(0), m_hEvent(CreateEvent(NULL, FALSE, FALSE, NULL)), m_bEOS(FALSE), m_hrStatus(S_OK), m_reader(NULL), m_dwStreamIndex(0), m_lastSampleTimestamp(0)
+        m_nRefCount(0), m_hEvent(CreateEvent(NULL, FALSE, FALSE, NULL)), m_bEOS(FALSE), m_hrStatus(S_OK), m_reader(NULL), m_dwStreamIndex(0)
     {
     }
 
@@ -441,12 +456,19 @@ public:
             if (pSample)
             {
                 CV_LOG_DEBUG(NULL, "videoio(MSMF): got frame at " << llTimestamp);
-                if (m_lastSample.Get())
+                if (m_capturedFrames.size() >= MSMF_READER_MAX_QUEUE_SIZE)
                 {
-                    CV_LOG_DEBUG(NULL, "videoio(MSMF): drop frame (not processed)");
+#if 0
+                    CV_LOG_DEBUG(NULL, "videoio(MSMF): drop frame (not processed). Timestamp=" << m_capturedFrames.front().timestamp);
+                    m_capturedFrames.pop();
+#else
+                    // this branch reduces latency if we drop frames due to slow processing.
+                    // avoid fetching of already outdated frames from the queue's front.
+                    CV_LOG_DEBUG(NULL, "videoio(MSMF): drop previous frames (not processed): " << m_capturedFrames.size());
+                    std::queue<CapturedFrameInfo>().swap(m_capturedFrames);  // similar to missing m_capturedFrames.clean();
+#endif
                 }
-                m_lastSampleTimestamp = llTimestamp;
-                m_lastSample = pSample;
+                m_capturedFrames.emplace(CapturedFrameInfo{ llTimestamp, _ComPtr<IMFSample>(pSample), hrStatus });
             }
         }
         else
@@ -483,37 +505,50 @@ public:
         return S_OK;
     }
 
-    HRESULT Wait(DWORD dwMilliseconds, _ComPtr<IMFSample>& mediaSample, BOOL& pbEOS)
+    HRESULT Wait(DWORD dwMilliseconds, _ComPtr<IMFSample>& mediaSample, LONGLONG& sampleTimestamp, BOOL& pbEOS)
     {
         pbEOS = FALSE;
 
-        DWORD dwResult = WaitForSingleObject(m_hEvent, dwMilliseconds);
-        if (dwResult == WAIT_TIMEOUT)
+        for (;;)
         {
-            return E_PENDING;
-        }
-        else if (dwResult != WAIT_OBJECT_0)
-        {
-            return HRESULT_FROM_WIN32(GetLastError());
-        }
+            {
+                cv::AutoLock lock(m_mutex);
 
-        pbEOS = m_bEOS;
-        if (!pbEOS)
-        {
-            cv::AutoLock lock(m_mutex);
-            mediaSample = m_lastSample;
-            CV_Assert(mediaSample);
-            m_lastSample.Release();
-            ResetEvent(m_hEvent);  // event is auto-reset, but we need this forced reset due time gap between wait() and mutex hold.
+                pbEOS = m_bEOS && m_capturedFrames.empty();
+                if (pbEOS)
+                    return m_hrStatus;
+
+                if (!m_capturedFrames.empty())
+                {
+                    CV_Assert(!m_capturedFrames.empty());
+                    CapturedFrameInfo frameInfo = m_capturedFrames.front(); m_capturedFrames.pop();
+                    CV_LOG_DEBUG(NULL, "videoio(MSMF): handle frame at " << frameInfo.timestamp);
+                    mediaSample = frameInfo.sample;
+                    CV_Assert(mediaSample);
+                    sampleTimestamp = frameInfo.timestamp;
+                    ResetEvent(m_hEvent);  // event is auto-reset, but we need this forced reset due time gap between wait() and mutex hold.
+                    return frameInfo.hrStatus;
+                }
+            }
+
+            CV_LOG_DEBUG(NULL, "videoio(MSMF): waiting for frame... ");
+            DWORD dwResult = WaitForSingleObject(m_hEvent, dwMilliseconds);
+            if (dwResult == WAIT_TIMEOUT)
+            {
+                return E_PENDING;
+            }
+            else if (dwResult != WAIT_OBJECT_0)
+            {
+                return HRESULT_FROM_WIN32(GetLastError());
+            }
         }
-        return m_hrStatus;
     }
 
 private:
     // Destructor is private. Caller should call Release.
     virtual ~SourceReaderCB()
     {
-        CV_LOG_WARNING(NULL, "terminating async callback");
+        CV_LOG_INFO(NULL, "terminating async callback");
     }
 
 public:
@@ -525,8 +560,14 @@ public:
 
     IMFSourceReader *m_reader;
     DWORD m_dwStreamIndex;
-    LONGLONG m_lastSampleTimestamp;
-    _ComPtr<IMFSample>  m_lastSample;
+
+    struct CapturedFrameInfo {
+        LONGLONG timestamp;
+        _ComPtr<IMFSample> sample;
+        HRESULT hrStatus;
+    };
+
+    std::queue<CapturedFrameInfo> m_capturedFrames;
 };
 
 //==================================================================================================
@@ -598,7 +639,7 @@ public:
         {
             if (i->second.majorType == MFMediaType_Video)
             {
-                if (best.second.isEmpty() || i->second.VideoIsBetterThan(best.second, newType))
+                if (best.second.isEmpty() || (i->second.VideoIsBetterThan(best.second, newType) && i->second.VideoIsAvailable()))
                 {
                     best = *i;
                 }
@@ -666,7 +707,7 @@ public:
         if (FAILED(MFCreateAttributes(&attr, 1)) ||
             FAILED(attr->SetGUID(MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE, sourceType)))
         {
-            CV_Error(CV_StsError, "Failed to create attributes");
+            CV_Error(cv::Error::StsError, "Failed to create attributes");
         }
         if (FAILED(MFEnumDeviceSources(attr.Get(), &devices, &count)))
         {
@@ -727,6 +768,7 @@ protected:
     bool configureHW(bool enable);
     bool configureStreams(const cv::VideoCaptureParameters&);
     bool setAudioProperties(const cv::VideoCaptureParameters&);
+    bool checkAudioProperties();
 
     template <typename CtrlT>
     bool readComplexPropery(long prop, long& val) const;
@@ -766,6 +808,7 @@ protected:
     unsigned int audioBaseIndex;
     int outputVideoFormat;
     int outputAudioFormat;
+    UINT32 audioSamplesPerSecond;
     bool convertFormat;
     MFTIME duration;
     LONGLONG frameStep;
@@ -818,6 +861,7 @@ CvCapture_MSMF::CvCapture_MSMF():
     audioBaseIndex(1),
     outputVideoFormat(CV_CAP_MODE_BGR),
     outputAudioFormat(CV_16S),
+    audioSamplesPerSecond(0),
     convertFormat(true),
     duration(0),
     frameStep(0),
@@ -917,14 +961,14 @@ _ComPtr<IMFAttributes> CvCapture_MSMF::getDefaultSourceConfig(UINT32 num)
         FAILED(res->SetUINT32(MF_SOURCE_READER_ENABLE_ADVANCED_VIDEO_PROCESSING, true))
         )
     {
-        CV_Error(CV_StsError, "Failed to create attributes");
+        CV_Error(cv::Error::StsError, "Failed to create attributes");
     }
 #ifdef HAVE_MSMF_DXVA
     if (D3DMgr)
     {
         if (FAILED(res->SetUnknown(MF_SOURCE_READER_D3D_MANAGER, D3DMgr.Get())))
         {
-            CV_Error(CV_StsError, "Failed to create attributes");
+            CV_Error(cv::Error::StsError, "Failed to create attributes");
         }
     }
 #endif
@@ -1047,7 +1091,7 @@ bool CvCapture_MSMF::configureAudioOutput(MediaType newType)
     MediaType newFormat = bestMatch.second;
 
     newFormat.majorType = MFMediaType_Audio;
-    newFormat.nSamplesPerSec = 44100;
+    newFormat.nSamplesPerSec = (audioSamplesPerSecond == 0) ? 44100 : audioSamplesPerSecond;
     switch (outputAudioFormat)
     {
     case CV_8S:
@@ -1120,7 +1164,12 @@ bool CvCapture_MSMF::configureVideoOutput(MediaType newType, cv::uint32_t outFor
     {
         initStream(dwVideoStreamIndex, nativeFormat);
     }
-    return initStream(dwVideoStreamIndex, newFormat);
+    if (!initStream(dwVideoStreamIndex, newFormat))
+    {
+        return false;
+    }
+    outputVideoFormat = outFormat;
+    return true;
 }
 
 bool CvCapture_MSMF::configureOutput()
@@ -1147,7 +1196,8 @@ bool CvCapture_MSMF::open(int index, const cv::VideoCaptureParameters* params)
     if (params)
     {
         configureHW(*params);
-        configureStreams(*params);
+        if (!(configureStreams(*params) && setAudioProperties(*params)))
+            return false;
     }
     if (videoStream != -1 && audioStream != -1 || videoStream == -1 && audioStream == -1)
     {
@@ -1189,6 +1239,12 @@ bool CvCapture_MSMF::open(int index, const cv::VideoCaptureParameters* params)
         close();
         return false;
     }
+    if (isOpen)
+    {
+        if (audioStream != -1)
+            if (!checkAudioProperties())
+                return false;
+    }
 
     return isOpen;
 }
@@ -1202,8 +1258,8 @@ bool CvCapture_MSMF::open(const cv::String& _filename, const cv::VideoCapturePar
     if (params)
     {
         configureHW(*params);
-        configureStreams(*params);
-        setAudioProperties(*params);
+        if (!(configureStreams(*params) && setAudioProperties(*params)))
+            return false;
     }
     // Set source reader parameters
     _ComPtr<IMFAttributes> attr = getDefaultSourceConfig();
@@ -1235,12 +1291,19 @@ bool CvCapture_MSMF::open(const cv::String& _filename, const cv::VideoCapturePar
         return false;
     }
     if (isOpen)
-        if (audioStream != -1 && videoStream != -1)
+    {
+        if (audioStream != -1)
         {
-            isOpen = grabFrame();
-            if (isOpen)
-                grabIsDone = true;
+            if (!checkAudioProperties())
+                return false;
+            if (videoStream != -1)
+            {
+                isOpen = grabFrame();
+                if (isOpen)
+                    grabIsDone = true;
+            }
         }
+    }
     return isOpen;
 }
 
@@ -1318,14 +1381,49 @@ bool CvCapture_MSMF::setAudioProperties(const cv::VideoCaptureParameters& params
             outputAudioFormat = value;
         }
     }
+    if (params.has(CAP_PROP_AUDIO_SAMPLES_PER_SECOND))
+    {
+        int value = static_cast<int>(params.get<double>(CAP_PROP_AUDIO_SAMPLES_PER_SECOND));
+        if (value < 0)
+        {
+            CV_LOG_ERROR(NULL, "VIDEOIO/MSMF: CAP_PROP_AUDIO_SAMPLES_PER_SECOND parameter can't be negative: " << value);
+            return false;
+        }
+        else
+        {
+            audioSamplesPerSecond = value;
+        }
+    }
     if (params.has(CAP_PROP_AUDIO_SYNCHRONIZE))
     {
-        int value = static_cast<int>(params.get<double>(CAP_PROP_AUDIO_SYNCHRONIZE));
+        int value = static_cast<UINT32>(params.get<double>(CAP_PROP_AUDIO_SYNCHRONIZE));
         syncLastFrame = (value != 0) ? true : false;
     }
     return true;
 }
-
+bool CvCapture_MSMF::checkAudioProperties()
+{
+    if (audioSamplesPerSecond != 0)
+    {
+        _ComPtr<IMFMediaType> type;
+        UINT32 actualAudioSamplesPerSecond = 0;
+        HRESULT hr = videoFileSource->GetCurrentMediaType(dwAudioStreamIndex, &type);
+        if (SUCCEEDED(hr))
+        {
+            type->GetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND , &actualAudioSamplesPerSecond);
+            if (actualAudioSamplesPerSecond != audioSamplesPerSecond)
+            {
+                CV_LOG_ERROR(NULL, "VIDEOIO/MSMF: CAP_PROP_AUDIO_SAMPLES_PER_SECOND parameter value is invalid/unsupported: " << audioSamplesPerSecond
+                            << ". Current value of CAP_PROP_AUDIO_SAMPLES_PER_SECOND: " << actualAudioSamplesPerSecond);
+                close();
+                return false;
+            }
+            return true;
+        }
+        return false;
+    }
+    return true;
+}
 bool CvCapture_MSMF::grabVideoFrame()
 {
     DWORD streamIndex,  flags;
@@ -1517,7 +1615,6 @@ bool CvCapture_MSMF::configureAudioFrame()
         }
         audioDataInUse.clear();
         audioDataInUse.shrink_to_fit();
-
         return true;
     }
     else
@@ -1638,6 +1735,7 @@ bool CvCapture_MSMF::grabFrame()
     if (grabIsDone)
     {
         grabIsDone = false;
+        CV_LOG_DEBUG(NULL, "videoio(MSMF): return pre-grabbed frame " << usedVideoSampleTime);
         return true;
     }
 
@@ -1665,7 +1763,8 @@ bool CvCapture_MSMF::grabFrame()
             }
         }
         BOOL bEOS = false;
-        if (FAILED(hr = reader->Wait( videoStream == -1 ? INFINITE : 10000, (videoStream != -1) ? usedVideoSample : audioSamples[0], bEOS)))  // 10 sec
+        LONGLONG timestamp = 0;
+        if (FAILED(hr = reader->Wait( videoStream == -1 ? INFINITE : 10000, (videoStream != -1) ? usedVideoSample : audioSamples[0], timestamp, bEOS)))  // 10 sec
         {
             CV_LOG_WARNING(NULL, "videoio(MSMF): can't grab frame. Error: " << hr);
             return false;
@@ -1676,10 +1775,11 @@ bool CvCapture_MSMF::grabFrame()
             return false;
         }
         if (videoStream != -1)
-            usedVideoSampleTime = reader->m_lastSampleTimestamp;
+            usedVideoSampleTime = timestamp;
         if (audioStream != -1)
             return configureAudioFrame();
 
+        CV_LOG_DEBUG(NULL, "videoio(MSMF): grabbed frame " << usedVideoSampleTime);
         return true;
     }
     else if (isOpen)
@@ -1713,6 +1813,7 @@ bool CvCapture_MSMF::grabFrame()
 bool CvCapture_MSMF::retrieveVideoFrame(cv::OutputArray frame)
 {
     CV_TRACE_FUNCTION();
+    CV_LOG_DEBUG(NULL, "videoio(MSMF): retrieve video frame start...");
     do
     {
         if (!usedVideoSample)
@@ -1803,6 +1904,7 @@ bool CvCapture_MSMF::retrieveVideoFrame(cv::OutputArray frame)
             buffer2d->Unlock2D();
         else
             buf->Unlock();
+        CV_LOG_DEBUG(NULL, "videoio(MSMF): retrieve video frame done!");
         return !frame.empty();
     } while (0);
 
@@ -2377,6 +2479,12 @@ const GUID CvVideoWriter_MSMF::FourCC2GUID(int fourcc)
 #endif
         case CV_FOURCC_MACRO('H', '2', '6', '4'):
                 return MFVideoFormat_H264; break;
+#if defined(NTDDI_WIN10)
+        case CV_FOURCC_MACRO('H', '2', '6', '5'):
+                return MFVideoFormat_H265;  break;
+        case CV_FOURCC_MACRO('H', 'E', 'V', 'C'):
+                return MFVideoFormat_HEVC;  break;
+#endif
         case CV_FOURCC_MACRO('M', '4', 'S', '2'):
                 return MFVideoFormat_M4S2; break;
         case CV_FOURCC_MACRO('M', 'J', 'P', 'G'):
@@ -2621,8 +2729,6 @@ CvResult CV_API_CALL cv_capture_open_with_params(
     if (!handle)
         return CV_ERROR_FAIL;
     *handle = NULL;
-    if (!filename)
-        return CV_ERROR_FAIL;
     CaptureT* cap = 0;
     try
     {

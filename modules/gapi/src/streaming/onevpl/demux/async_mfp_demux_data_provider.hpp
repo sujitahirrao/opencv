@@ -13,7 +13,8 @@
 #include <queue>
 
 #ifdef HAVE_ONEVPL
-#include <vpl/mfxvideo.h>
+#include "streaming/onevpl/onevpl_export.hpp"
+#include <opencv2/gapi/streaming/onevpl/data_provider_interface.hpp>
 
 #ifdef _WIN32
 #define NOMINMAX
@@ -28,7 +29,6 @@
 #include <wmcodecdsp.h>
 #undef NOMINMAX
 
-#include <opencv2/gapi/streaming/onevpl/data_provider_interface.hpp>
 #include "streaming/onevpl/data_provider_defines.hpp"
 #include "streaming/onevpl/utils.hpp"
 
